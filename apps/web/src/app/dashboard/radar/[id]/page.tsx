@@ -84,7 +84,7 @@ export default function ProductDetailPage() {
 
   // Suggestions
   const [suggestions, setSuggestions] = useState<string[]>([]);
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(true);
   const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
 
   const loadProduct = useCallback(async () => {
@@ -103,8 +103,8 @@ export default function ProductDetailPage() {
     try {
       const s = await suggestPrompts(productId);
       setSuggestions(s);
-    } catch {
-      // silent — suggestions are optional
+    } catch (err) {
+      console.error("Failed to load suggestions:", err);
     } finally {
       setLoadingSuggestions(false);
     }

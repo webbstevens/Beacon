@@ -536,7 +536,7 @@ Example format: ["Best project management tools for small teams", "Top alternati
 
     try:
         message = claude.messages.create(
-            model="claude-haiku-4-20250514",
+            model="claude-sonnet-4-20250514",
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -680,7 +680,7 @@ Rules:
 
     try:
         result = claude.messages.create(
-            model="claude-haiku-4-20250514",
+            model="claude-sonnet-4-20250514",
             max_tokens=200,
             messages=[{"role": "user", "content": extraction_prompt}],
         )
