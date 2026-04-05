@@ -1,7 +1,9 @@
+import json
 import os
 import re
 import ipaddress
 import logging
+from typing import Optional
 from urllib.parse import urlparse
 
 import anthropic
@@ -19,6 +21,8 @@ load_dotenv()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 RATE_LIMIT_PER_DAY = 10
 
@@ -49,6 +53,21 @@ class GenerateResponse(BaseModel):
     id: str
     url: str
     markdown: str
+
+
+# Radar models
+class ProductScrapeRequest(BaseModel):
+    url: HttpUrl
+
+
+class PromptCreateRequest(BaseModel):
+    product_id: str
+    prompt_text: str
+
+
+class PromptBulkCreateRequest(BaseModel):
+    product_id: str
+    prompts: list[str]
 
 
 # ─── Helpers ─── #
@@ -347,3 +366,455 @@ async def delete_generation(generation_id: str, authorization: str = Header(...)
 
     supabase.table("generations").delete().eq("id", generation_id).execute()
     return {"deleted": True}
+
+
+# ─── Radar: Product & Prompt Management (Epic 1) ─── #
+
+@app.post("/api/products/scrape")
+async def scrape_product(body: ProductScrapeRequest, authorization: str = Header(...)):
+    """
+    Scrape a product URL, extract title + context, store in products table.
+    """
+    user_id = get_user_id_from_token(authorization)
+    url = validate_url(str(body.url))
+
+    # Scrape the page
+    scraped = await scrape_url(url)
+
+    # Build a compact context string for LLM matching later
+    context_parts = []
+    if scraped["title"]:
+        context_parts.append(scraped["title"])
+    if scraped["meta_description"]:
+        context_parts.append(scraped["meta_description"])
+    if scraped["body_text"]:
+        context_parts.append(scraped["body_text"][:2000])
+    context = "\n".join(context_parts)
+
+    # Insert into products
+    result = (
+        supabase.table("products")
+        .insert({
+            "user_id": user_id,
+            "url": url,
+            "scraped_title": scraped["title"] or url,
+            "scraped_context": context,
+        })
+        .execute()
+    )
+
+    product = result.data[0]
+    return {
+        "id": product["id"],
+        "url": product["url"],
+        "scraped_title": product["scraped_title"],
+        "created_at": product["created_at"],
+    }
+
+
+@app.get("/api/products")
+async def list_products(authorization: str = Header(...)):
+    """List all products for the authenticated user."""
+    user_id = get_user_id_from_token(authorization)
+
+    result = (
+        supabase.table("products")
+        .select("id, url, scraped_title, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    return {"products": result.data}
+
+
+@app.get("/api/products/{product_id}")
+async def get_product(product_id: str, authorization: str = Header(...)):
+    """Get a single product with its tracked prompts and latest scan results."""
+    user_id = get_user_id_from_token(authorization)
+
+    # Fetch product
+    prod = (
+        supabase.table("products")
+        .select("*")
+        .eq("id", product_id)
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+    if not prod.data:
+        raise HTTPException(status_code=404, detail="Product not found.")
+
+    # Fetch tracked prompts
+    prompts = (
+        supabase.table("tracked_prompts")
+        .select("id, prompt_text, frequency, created_at")
+        .eq("product_id", product_id)
+        .order("created_at")
+        .execute()
+    )
+
+    # Fetch latest scan results for each prompt
+    prompt_ids = [p["id"] for p in prompts.data]
+    scans = []
+    if prompt_ids:
+        scans_result = (
+            supabase.table("scan_results")
+            .select("id, prompt_id, model_name, mentioned, position, scanned_at")
+            .in_("prompt_id", prompt_ids)
+            .order("scanned_at", desc=True)
+            .limit(200)
+            .execute()
+        )
+        scans = scans_result.data
+
+    return {
+        "product": prod.data,
+        "prompts": prompts.data,
+        "scans": scans,
+    }
+
+
+@app.delete("/api/products/{product_id}")
+async def delete_product(product_id: str, authorization: str = Header(...)):
+    """Delete a product (cascades to prompts and scan results)."""
+    user_id = get_user_id_from_token(authorization)
+
+    check = (
+        supabase.table("products")
+        .select("id")
+        .eq("id", product_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Product not found.")
+
+    supabase.table("products").delete().eq("id", product_id).execute()
+    return {"deleted": True}
+
+
+@app.post("/api/prompts")
+async def create_prompts(body: PromptBulkCreateRequest, authorization: str = Header(...)):
+    """Add tracked prompts to a product."""
+    user_id = get_user_id_from_token(authorization)
+
+    # Verify product ownership
+    check = (
+        supabase.table("products")
+        .select("id")
+        .eq("id", body.product_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Product not found.")
+
+    rows = [{"product_id": body.product_id, "prompt_text": p.strip()} for p in body.prompts if p.strip()]
+    if not rows:
+        raise HTTPException(status_code=400, detail="No valid prompts provided.")
+
+    result = supabase.table("tracked_prompts").insert(rows).execute()
+    return {"prompts": result.data}
+
+
+@app.delete("/api/prompts/{prompt_id}")
+async def delete_prompt(prompt_id: str, authorization: str = Header(...)):
+    """Delete a tracked prompt."""
+    user_id = get_user_id_from_token(authorization)
+
+    # Verify ownership via join
+    check = (
+        supabase.table("tracked_prompts")
+        .select("id, product_id, products(user_id)")
+        .eq("id", prompt_id)
+        .execute()
+    )
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Prompt not found.")
+
+    product_data = check.data[0].get("products")
+    if not product_data or product_data.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized.")
+
+    supabase.table("tracked_prompts").delete().eq("id", prompt_id).execute()
+    return {"deleted": True}
+
+
+# ─── Radar: LLM Scanning Engine (Epic 2) ─── #
+
+async def query_openai(prompt_text: str) -> str:
+    """Query OpenAI ChatGPT with a buyer prompt."""
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenAI API key not configured.")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt_text}],
+                "max_tokens": 1024,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+
+async def query_gemini(prompt_text: str) -> str:
+    """Query Google Gemini with a buyer prompt."""
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="Gemini API key not configured.")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt_text}]}]},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+async def query_claude_model(prompt_text: str) -> str:
+    """Query Claude with a buyer prompt."""
+    message = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt_text}],
+    )
+    return message.content[0].text
+
+
+def extract_mention(raw_response: str, scraped_title: str, product_url: str) -> dict:
+    """
+    Use Claude to determine if the product was mentioned in an LLM response
+    and what position it appeared in.
+    """
+    # Build search terms from the product's title and URL domain
+    domain = urlparse(product_url).hostname or ""
+    search_terms = f"Product: {scraped_title}\nDomain: {domain}\nURL: {product_url}"
+
+    extraction_prompt = f"""Analyze the following AI response to determine if a specific product/brand was mentioned.
+
+{search_terms}
+
+AI Response to analyze:
+\"\"\"
+{raw_response[:3000]}
+\"\"\"
+
+Respond in JSON format only:
+{{
+  "mentioned": true/false,
+  "position": <integer 1-10 or null if not mentioned — what position was this product/brand recommended at?>
+}}
+
+Rules:
+- "mentioned" is true if the product name, brand, or domain appears in the response as a recommendation
+- "position" is the ordinal rank (1 = first recommendation, 2 = second, etc.)
+- If mentioned but not in a ranked list, set position to 1
+- If not mentioned at all, set position to null"""
+
+    try:
+        result = claude.messages.create(
+            model="claude-haiku-4-20250514",
+            max_tokens=200,
+            messages=[{"role": "user", "content": extraction_prompt}],
+        )
+        text = result.content[0].text.strip()
+        # Parse JSON from the response
+        # Handle cases where Claude wraps it in ```json blocks
+        if "```" in text:
+            text = text.split("```")[1].replace("json", "").strip()
+        parsed = json.loads(text)
+        return {
+            "mentioned": bool(parsed.get("mentioned", False)),
+            "position": parsed.get("position"),
+        }
+    except Exception as e:
+        logger.warning(f"Extraction failed: {e}")
+        return {"mentioned": False, "position": None}
+
+
+@app.post("/api/scan/{product_id}")
+async def run_scan(product_id: str, authorization: str = Header(...)):
+    """
+    Run a visibility scan for all tracked prompts on a product.
+    Queries ChatGPT, Gemini, and Claude, then stores results.
+    """
+    user_id = get_user_id_from_token(authorization)
+
+    # Fetch product
+    prod = (
+        supabase.table("products")
+        .select("*")
+        .eq("id", product_id)
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+    if not prod.data:
+        raise HTTPException(status_code=404, detail="Product not found.")
+
+    product = prod.data
+
+    # Fetch tracked prompts
+    prompts = (
+        supabase.table("tracked_prompts")
+        .select("id, prompt_text")
+        .eq("product_id", product_id)
+        .execute()
+    )
+    if not prompts.data:
+        raise HTTPException(status_code=400, detail="No tracked prompts. Add prompts before scanning.")
+
+    results = []
+    models = []
+
+    # Build list of available models
+    if OPENAI_API_KEY:
+        models.append(("chatgpt", query_openai))
+    if GEMINI_API_KEY:
+        models.append(("gemini", query_gemini))
+    if ANTHROPIC_API_KEY:
+        models.append(("claude", query_claude_model))
+
+    if not models:
+        raise HTTPException(status_code=503, detail="No LLM API keys configured.")
+
+    for prompt in prompts.data:
+        for model_name, query_fn in models:
+            try:
+                raw_response = await query_fn(prompt["prompt_text"])
+                extraction = extract_mention(
+                    raw_response,
+                    product.get("scraped_title", ""),
+                    product.get("url", ""),
+                )
+
+                scan_row = {
+                    "prompt_id": prompt["id"],
+                    "model_name": model_name,
+                    "mentioned": extraction["mentioned"],
+                    "position": extraction["position"],
+                    "raw_response": raw_response[:5000],  # cap storage
+                }
+
+                supabase.table("scan_results").insert(scan_row).execute()
+                results.append({**scan_row, "prompt_text": prompt["prompt_text"]})
+
+            except Exception as e:
+                logger.error(f"Scan failed for {model_name}/{prompt['id']}: {e}")
+                results.append({
+                    "prompt_id": prompt["id"],
+                    "prompt_text": prompt["prompt_text"],
+                    "model_name": model_name,
+                    "error": str(e),
+                })
+
+    return {"scan_results": results}
+
+
+@app.post("/api/scan/cron")
+async def cron_scan(authorization: str = Header(...)):
+    """
+    Run scans for ALL products belonging to the user.
+    Designed to be called by an external cron service.
+    """
+    user_id = get_user_id_from_token(authorization)
+
+    products = (
+        supabase.table("products")
+        .select("id")
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+    total_scanned = 0
+    for prod in products.data:
+        try:
+            # Reuse the single-product scan logic
+            result = await run_scan(prod["id"], authorization)
+            total_scanned += len(result.get("scan_results", []))
+        except Exception as e:
+            logger.error(f"Cron scan failed for product {prod['id']}: {e}")
+
+    return {"products_scanned": len(products.data), "total_results": total_scanned}
+
+
+# ─── Radar: Dashboard Data (Epic 3) ─── #
+
+@app.get("/api/dashboard/visibility")
+async def dashboard_visibility(authorization: str = Header(...)):
+    """
+    Get visibility scores for all products. Returns each product
+    with its overall mention rate across all models and prompts.
+    """
+    user_id = get_user_id_from_token(authorization)
+
+    # Get all products
+    products = (
+        supabase.table("products")
+        .select("id, url, scraped_title, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    dashboard_data = []
+    for prod in products.data:
+        # Get prompts for this product
+        prompts = (
+            supabase.table("tracked_prompts")
+            .select("id")
+            .eq("product_id", prod["id"])
+            .execute()
+        )
+        prompt_ids = [p["id"] for p in prompts.data]
+
+        total_scans = 0
+        total_mentioned = 0
+        model_scores = {}
+
+        if prompt_ids:
+            scans = (
+                supabase.table("scan_results")
+                .select("model_name, mentioned")
+                .in_("prompt_id", prompt_ids)
+                .execute()
+            )
+
+            for scan in scans.data:
+                total_scans += 1
+                if scan["mentioned"]:
+                    total_mentioned += 1
+
+                model = scan["model_name"]
+                if model not in model_scores:
+                    model_scores[model] = {"total": 0, "mentioned": 0}
+                model_scores[model]["total"] += 1
+                if scan["mentioned"]:
+                    model_scores[model]["mentioned"] += 1
+
+        visibility_score = round((total_mentioned / total_scans * 100), 1) if total_scans > 0 else 0
+
+        per_model = {}
+        for model, data in model_scores.items():
+            per_model[model] = round((data["mentioned"] / data["total"] * 100), 1) if data["total"] > 0 else 0
+
+        dashboard_data.append({
+            "id": prod["id"],
+            "url": prod["url"],
+            "scraped_title": prod["scraped_title"],
+            "created_at": prod["created_at"],
+            "prompt_count": len(prompt_ids),
+            "scan_count": total_scans,
+            "visibility_score": visibility_score,
+            "per_model": per_model,
+        })
+
+    return {"products": dashboard_data}
