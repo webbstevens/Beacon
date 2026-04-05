@@ -21,12 +21,14 @@ import {
   ExternalLink,
   Check,
   X,
+  Sparkles,
 } from "lucide-react";
 import {
   getProduct,
   createPrompts,
   deletePrompt,
   runScan,
+  suggestPrompts,
   type ProductDetail,
   type ScanResult,
 } from "@/lib/radar-api";
@@ -80,6 +82,11 @@ export default function ProductDetailPage() {
   // Deleting prompts
   const [deletingPromptId, setDeletingPromptId] = useState<string | null>(null);
 
+  // Suggestions
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [addingSuggestion, setAddingSuggestion] = useState<string | null>(null);
+
   const loadProduct = useCallback(async () => {
     try {
       const detail = await getProduct(productId);
@@ -91,9 +98,53 @@ export default function ProductDetailPage() {
     }
   }, [productId]);
 
+  const loadSuggestions = useCallback(async () => {
+    setLoadingSuggestions(true);
+    try {
+      const s = await suggestPrompts(productId);
+      setSuggestions(s);
+    } catch {
+      // silent — suggestions are optional
+    } finally {
+      setLoadingSuggestions(false);
+    }
+  }, [productId]);
+
   useEffect(() => {
     loadProduct();
-  }, [loadProduct]);
+    loadSuggestions();
+  }, [loadProduct, loadSuggestions]);
+
+  async function handleAddSuggestion(text: string) {
+    setAddingSuggestion(text);
+    try {
+      await createPrompts(productId, [text]);
+      setSuggestions((prev) => prev.filter((s) => s !== text));
+      await loadProduct();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to add prompt."
+      );
+    } finally {
+      setAddingSuggestion(null);
+    }
+  }
+
+  async function handleAddAllSuggestions() {
+    if (suggestions.length === 0) return;
+    setAddingPrompts(true);
+    try {
+      await createPrompts(productId, suggestions);
+      setSuggestions([]);
+      await loadProduct();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to add prompts."
+      );
+    } finally {
+      setAddingPrompts(false);
+    }
+  }
 
   async function handleAddPrompts(e: React.FormEvent) {
     e.preventDefault();
@@ -274,6 +325,67 @@ export default function ProductDetailPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
+          {/* Auto-suggested prompts */}
+          {(loadingSuggestions || suggestions.length > 0) && (
+            <div className="mb-6 rounded-lg border border-blue-500/20 bg-blue-500/5 p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="text-sm font-medium text-blue-300 flex items-center gap-2">
+                  <Sparkles className="h-4 w-4" />
+                  Suggested Prompts
+                </h4>
+                {suggestions.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={handleAddAllSuggestions}
+                    disabled={addingPrompts}
+                  >
+                    {addingPrompts ? (
+                      <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                    ) : (
+                      <Plus className="mr-1 h-3 w-3" />
+                    )}
+                    Add All
+                  </Button>
+                )}
+              </div>
+              {loadingSuggestions ? (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground py-2">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                  Generating suggestions from your product...
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {suggestions.map((s) => (
+                    <div
+                      key={s}
+                      className="flex items-center gap-2 rounded border border-border/50 bg-background/50 p-2 text-sm"
+                    >
+                      <span className="flex-1">{s}</span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-7 px-2 text-xs"
+                        onClick={() => handleAddSuggestion(s)}
+                        disabled={addingSuggestion === s}
+                      >
+                        {addingSuggestion === s ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <>
+                            <Plus className="mr-1 h-3 w-3" />
+                            Add
+                          </>
+                        )}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <form onSubmit={handleAddPrompts} className="space-y-3">
             {promptInputs.map((val, i) => (
               <Input

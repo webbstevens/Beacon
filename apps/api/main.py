@@ -494,6 +494,65 @@ async def delete_product(product_id: str, authorization: str = Header(...)):
     return {"deleted": True}
 
 
+@app.get("/api/products/{product_id}/suggest-prompts")
+async def suggest_prompts(product_id: str, authorization: str = Header(...)):
+    """
+    Use Claude to auto-generate the top 5 buyer search prompts
+    based on the product's scraped context and keywords.
+    """
+    user_id = get_user_id_from_token(authorization)
+
+    prod = (
+        supabase.table("products")
+        .select("*")
+        .eq("id", product_id)
+        .eq("user_id", user_id)
+        .single()
+        .execute()
+    )
+    if not prod.data:
+        raise HTTPException(status_code=404, detail="Product not found.")
+
+    product = prod.data
+    context = product.get("scraped_context", "") or ""
+    title = product.get("scraped_title", "") or ""
+    url = product.get("url", "") or ""
+
+    prompt = f"""You are a search behavior expert. Given the following product/website information, generate exactly 5 realistic buyer search prompts that a potential customer would type into an AI assistant (like ChatGPT, Gemini, or Claude) when looking for this type of product or service.
+
+Product: {title}
+URL: {url}
+Context:
+{context[:2000]}
+
+Rules:
+- Write prompts that real buyers would actually ask an AI assistant
+- Include a mix of: "best [category]", "top [category] for [use case]", comparison queries, and recommendation queries
+- Be specific to the product's niche, not generic
+- Each prompt should be 5-15 words
+- Return ONLY a JSON array of 5 strings, nothing else
+
+Example format: ["Best project management tools for small teams", "Top alternatives to Asana for startups", ...]"""
+
+    try:
+        message = claude.messages.create(
+            model="claude-haiku-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = message.content[0].text.strip()
+        # Parse JSON array
+        if "```" in text:
+            text = text.split("```")[1].replace("json", "").strip()
+        suggestions = json.loads(text)
+        if not isinstance(suggestions, list):
+            suggestions = []
+        return {"suggestions": suggestions[:5]}
+    except Exception as e:
+        logger.error(f"Suggest prompts failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to generate prompt suggestions.")
+
+
 @app.post("/api/prompts")
 async def create_prompts(body: PromptBulkCreateRequest, authorization: str = Header(...)):
     """Add tracked prompts to a product."""

@@ -102,6 +102,19 @@ export async function deleteProduct(id: string): Promise<void> {
   if (!res.ok) throw new Error("Failed to delete product");
 }
 
+export async function suggestPrompts(productId: string): Promise<string[]> {
+  const headers = await getAuthHeaders();
+  const res = await fetch(`${API_URL}/api/products/${productId}/suggest-prompts`, {
+    headers,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Failed to suggest prompts (${res.status})`);
+  }
+  const data = await res.json();
+  return data.suggestions;
+}
+
 export async function createPrompts(
   productId: string,
   prompts: string[]
